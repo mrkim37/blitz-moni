@@ -2,7 +2,10 @@ import os
 import sys
 import time
 import logging
+import threading
 import urllib.request
+import urllib.error
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -16,6 +19,8 @@ APP_DASH_URL = os.getenv(
 APP_URL = os.getenv("APP_URL", "https://hyperdl.sunxsiam.prod.page")
 INTERVAL = int(os.getenv("CHECK_INTERVAL_MIN", "15")) * 60
 WAKE_TIMEOUT = int(os.getenv("WAKE_TIMEOUT_SEC", "120"))
+READY_TIMEOUT = int(os.getenv("READY_TIMEOUT_SEC", "180"))
+PORT = int(os.getenv("PORT", "10000"))  # Render sets PORT automatically
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,18 +81,60 @@ def check_once(browser):
     finally:
         ctx.close()
 
-    # Real internet visit also counts as activity for Blitz and keeps it warm.
+    wait_until_ready()
+
+
+def http_status(url):
     try:
-        with urllib.request.urlopen(APP_URL, timeout=30) as r:
-            log.info("Ping %s -> HTTP %s", APP_URL, r.status)
-    except Exception as e:
-        log.warning("Ping %s failed: %s", APP_URL, e)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return None
+
+
+def wait_until_ready():
+    """A freshly woken app returns 404/502/503 for a while; retry until it answers 2xx/3xx."""
+    deadline = time.time() + READY_TIMEOUT
+    while True:
+        code = http_status(APP_URL)
+        if code and code < 400:
+            log.info("Ping %s -> HTTP %s (app is up)", APP_URL, code)
+            return
+        if time.time() > deadline:
+            log.warning("App still not ready after %ss (last status: %s)", READY_TIMEOUT, code)
+            return
+        log.info("App not ready yet (status: %s), retrying in 10s", code)
+        time.sleep(10)
+
+
+class Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    do_HEAD = do_GET
+
+    def log_message(self, *a):
+        pass
+
+
+def start_health_server():
+    """Open a port so Render treats this as a healthy web service."""
+    server = HTTPServer(("0.0.0.0", PORT), Health)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("Health server listening on port %s", PORT)
 
 
 def main():
     if not PASSWORD:
         log.error("BLITZ_PASSWORD is empty. Set it in .env")
         sys.exit(1)
+    start_health_server()
     log.info("Starting. Checking every %s min", INTERVAL // 60)
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
