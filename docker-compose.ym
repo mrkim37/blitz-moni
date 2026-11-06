@@ -1,0 +1,7 @@
+services:
+  blitz-waker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    init: true
+    ipc: host
